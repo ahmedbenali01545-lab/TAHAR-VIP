@@ -1,0 +1,79 @@
+name: Build Android APK from ZIP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GODOT_VERSION: "4.7.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract game ZIP
+        run: |
+          test -f forest_walk.zip || { echo "forest_walk.zip was not found in the repository root"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/game-source"
+          unzip -q forest_walk.zip -d "$RUNNER_TEMP/game-source"
+          PROJECT_FILE="$(find "$RUNNER_TEMP/game-source" -type f -name project.godot -print -quit)"
+          test -n "$PROJECT_FILE" || { echo "project.godot was not found inside the ZIP"; exit 1; }
+          echo "GODOT_PROJECT_DIR=$(dirname "$PROJECT_FILE")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK packages
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platform-tools" "build-tools;35.0.1" "platforms;android-35"
+
+      - name: Install Godot and export templates
+        run: |
+          BASE="https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable"
+          wget -q "$BASE/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip" -O godot.zip
+          wget -q "$BASE/Godot_v${GODOT_VERSION}-stable_export_templates.tpz" -O templates.tpz
+          unzip -q godot.zip
+          sudo mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          TPL="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$TPL"
+          unzip -q templates.tpz -d tpl
+          mv tpl/templates/* "$TPL/"
+          godot --version
+
+      - name: Configure Godot Android settings
+        run: |
+          mkdir -p "$HOME/.config/godot"
+          CONTENT=$(printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\nexport/android/java_sdk_path = "%s"\nexport/android/android_sdk_path = "%s"\n' "$JAVA_HOME" "$ANDROID_HOME")
+          echo "$CONTENT" > "$HOME/.config/godot/editor_settings-4.7.tres"
+          echo "$CONTENT" > "$HOME/.config/godot/editor_settings-4.tres"
+          keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android \
+            -keystore "$RUNNER_TEMP/debug.keystore" -storepass android \
+            -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$RUNNER_TEMP/debug.keystore" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
+
+      - name: Import project resources
+        run: cd "$GODOT_PROJECT_DIR" && godot --headless --editor --import
+
+      - name: Export APK
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build"
+          cd "$GODOT_PROJECT_DIR"
+          godot --headless --path . --export-debug "Android" "$GITHUB_WORKSPACE/build/forest_walk.apk"
+          test -s "$GITHUB_WORKSPACE/build/forest_walk.apk"
+          ls -lh "$GITHUB_WORKSPACE/build/forest_walk.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forest-walk-apk
+          path: build/forest_walk.apk
