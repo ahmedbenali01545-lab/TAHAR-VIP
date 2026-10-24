@@ -1,0 +1,89 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GODOT_VERSION: "4.7.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK packages
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platform-tools" "build-tools;35.0.1" "platforms;android-35" "cmake;3.10.2.4988404" "ndk;28.1.13356709"
+
+      - name: Install Godot and export templates
+        run: |
+          BASE="https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable"
+          wget -q "$BASE/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip" -O godot.zip
+          wget -q "$BASE/Godot_v${GODOT_VERSION}-stable_export_templates.tpz" -O templates.tpz
+          unzip -q godot.zip
+          sudo mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          TPL="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$TPL"
+          unzip -q templates.tpz -d tpl
+          mv tpl/templates/* "$TPL/"
+          godot --version
+
+      - name: Install Android build template (AndroidManifest.xml)
+        run: |
+          TPL="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          rm -rf android/build
+          mkdir -p android/build
+          unzip -q "$TPL/android_source.zip" -d android/build
+          echo "${GODOT_VERSION}.stable" > android/.build_version
+          touch android/.gdignore android/build/.gdignore
+          if [ -f android_overrides/AndroidManifest.xml ]; then
+            cp android_overrides/AndroidManifest.xml android/build/src/main/AndroidManifest.xml
+            echo "Custom AndroidManifest.xml applied"
+          fi
+          echo "=== AndroidManifest.xml ==="
+          cat android/build/src/main/AndroidManifest.xml
+
+      - name: Configure Godot Android settings
+        run: |
+          mkdir -p "$HOME/.config/godot"
+          CONTENT=$(printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\nexport/android/java_sdk_path = "%s"\nexport/android/android_sdk_path = "%s"\n' "$JAVA_HOME" "$ANDROID_HOME")
+          echo "$CONTENT" > "$HOME/.config/godot/editor_settings-4.7.tres"
+          echo "$CONTENT" > "$HOME/.config/godot/editor_settings-4.tres"
+          keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android \
+            -keystore "$RUNNER_TEMP/debug.keystore" -storepass android \
+            -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$RUNNER_TEMP/debug.keystore" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
+
+      - name: Import project resources
+        run: godot --headless --import || true
+
+      - name: Export APK
+        run: |
+          mkdir -p build
+          godot --headless --export-debug "Android" build/forest_walk.apk
+          ls -la build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forest-walk-apk
+          path: build/forest_walk.apk
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AndroidManifest
+          path: android/build/src/main/AndroidManifest.xml
