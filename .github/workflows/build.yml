@@ -1,0 +1,183 @@
+name: Build Coastal Explorer Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'project.godot'
+      - 'export_presets.cfg'
+      - 'scenes/**'
+      - 'scripts/**'
+      - 'assets/**'
+      - 'ui/**'
+      - 'tools/**'
+      - 'assets_optimized/**'
+      - 'game_assets.zip'
+      - 'build.yml'
+      - 'CoastalExplorer_Godot_Source.zip'
+      - 'game_project.zip'
+      - 'README_AR.md'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Unpack uploaded GLB assets ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Accept either an already-extracted Godot project or the source ZIP placed in the repo root.
+          if [[ ! -f project.godot ]]; then
+            PACKAGE=""
+            for candidate in CoastalExplorer_Godot_Source.zip game_project.zip; do
+              if [[ -f "$candidate" ]]; then PACKAGE="$candidate"; break; fi
+            done
+            if [[ -n "$PACKAGE" ]]; then
+              echo "Unpacking source project: $PACKAGE"
+              mkdir -p "$RUNNER_TEMP/source-package"
+              unzip -q -o "$PACKAGE" -d "$RUNNER_TEMP/source-package"
+              PROJECT_FILE="$(find "$RUNNER_TEMP/source-package" -maxdepth 4 -type f -name project.godot -print -quit)"
+              if [[ -z "$PROJECT_FILE" ]]; then echo "No project.godot found in source ZIP"; exit 1; fi
+              PROJECT_DIR="${PROJECT_FILE%/project.godot}"
+              cp -a "$PROJECT_DIR/." .
+            fi
+          fi
+          if [[ -f game_assets.zip ]]; then
+            echo "Found game_assets.zip; unpacking GLBs into the project root..."
+            unzip -o game_assets.zip -d .
+          else
+            echo "game_assets.zip is absent; using the checked-in assets/ folder."
+          fi
+          test -f project.godot
+          test -f assets/player.glb
+          test -f scenes/main.tscn
+          test -f scripts/world.gd
+          mkdir -p build
+          echo "GLB count: $(find assets -maxdepth 1 -type f -name '*.glb' | wc -l)"
+
+      - name: Optimize static GLBs for mobile rendering
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/glb-tools-venv"
+          "$RUNNER_TEMP/glb-tools-venv/bin/python" -m pip install --quiet --disable-pip-version-check trimesh
+          "$RUNNER_TEMP/glb-tools-venv/bin/python" tools/optimize_glb_assets.py --source assets --output assets_optimized
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@v4
+        with:
+          # The action installs command-line tools and accepts licenses. Avoid the
+          # retired SDK package named "tools"; install only explicit supported packages below.
+          packages: ''
+
+      - name: Install Android build packages required by Godot 4.7
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/.android/sdk}}"
+          mkdir -p "$SDK_ROOT"
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          sdkmanager --sdk_root="$SDK_ROOT" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.1" \
+            "ndk;28.1.13356709" \
+            "cmake;3.10.2.4988404"
+          test -x "$SDK_ROOT/platform-tools/adb"
+          test -d "$SDK_ROOT/platforms/android-35"
+          test -d "$SDK_ROOT/build-tools/35.0.1"
+          test -d "$SDK_ROOT/ndk/28.1.13356709"
+          test -d "$SDK_ROOT/cmake/3.10.2.4988404"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Download Godot 4.7.2 stable and Android export templates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/godot" "$RUNNER_TEMP/godot-templates"
+          curl --fail --location --retry 3 \
+            "https://github.com/godotengine/godot/releases/download/4.7.2-stable/Godot_v4.7.2-stable_linux.x86_64.zip" \
+            -o "$RUNNER_TEMP/godot/godot.zip"
+          unzip -q "$RUNNER_TEMP/godot/godot.zip" -d "$RUNNER_TEMP/godot/bin"
+          GODOT_BIN="$(find "$RUNNER_TEMP/godot/bin" -maxdepth 1 -type f -name 'Godot_v4.7.2-stable_linux.x86_64' -print -quit)"
+          if [[ -z "$GODOT_BIN" ]]; then
+            echo "Could not locate the Godot executable in the official archive."
+            find "$RUNNER_TEMP/godot/bin" -maxdepth 2 -type f -print
+            exit 1
+          fi
+          chmod +x "$GODOT_BIN"
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
+          curl --fail --location --retry 3 \
+            "https://github.com/godotengine/godot/releases/download/4.7.2-stable/Godot_v4.7.2-stable_export_templates.tpz" \
+            -o "$RUNNER_TEMP/godot-templates/templates.tpz"
+          unzip -q "$RUNNER_TEMP/godot-templates/templates.tpz" -d "$RUNNER_TEMP/godot-templates/unpacked"
+          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/4.7.2.stable"
+          mkdir -p "$TEMPLATE_DIR"
+          if [[ -d "$RUNNER_TEMP/godot-templates/unpacked/templates" ]]; then
+            cp -a "$RUNNER_TEMP/godot-templates/unpacked/templates/." "$TEMPLATE_DIR/"
+          else
+            cp -a "$RUNNER_TEMP/godot-templates/unpacked/." "$TEMPLATE_DIR/"
+          fi
+          test -f "$TEMPLATE_DIR/android_debug.apk"
+          test -f "$TEMPLATE_DIR/android_release.apk"
+          "$GODOT_BIN" --version
+
+      - name: Import and validate Godot project
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$GODOT_BIN" --headless --path . --editor --import
+          "$GODOT_BIN" --headless --path . --quit-after 5
+
+      - name: Create local debug keystore if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android"
+          if [[ ! -f "$HOME/.android/debug.keystore" ]]; then
+            keytool -genkeypair -v \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Export debug APK for arm64 Android devices
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          export GODOT_ANDROID_KEYSTORE_DEBUG_PATH="$HOME/.android/debug.keystore"
+          export GODOT_ANDROID_KEYSTORE_DEBUG_USER="androiddebugkey"
+          export GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD="android"
+          "$GODOT_BIN" --headless --path . --export-debug "Android" build/CoastalExplorer.apk
+          test -s build/CoastalExplorer.apk
+          ls -lh build/CoastalExplorer.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoastalExplorer-Android-APK
+          path: build/CoastalExplorer.apk
+          if-no-files-found: error
+          retention-days: 14
